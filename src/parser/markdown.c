@@ -3,21 +3,22 @@
 #include <string.h>
 #include <cmark.h>
 #include "parser/markdown.h"
+#include "utils/simd.h"
 #include "arena.h"
 
 #define FRONTMATTER_DELIMITER "---"
 
 static int parse_frontmatter(char* content, FrontMatter* fm, Arena* arena) {
-    char* start = strstr(content, FRONTMATTER_DELIMITER);
+    char* start = simd_strstr(content, FRONTMATTER_DELIMITER);
     if (!start) return 0;
     
-    char* end = strstr(start + 3, FRONTMATTER_DELIMITER);
+    char* end = simd_strstr(start + 3, FRONTMATTER_DELIMITER);
     if (!end) return 0;
     
     *end = '\0';
     char* yaml = start + 3;
     
-    char* title_start = strstr(yaml, "title:");
+    char* title_start = simd_strstr(yaml, "title:");
     if (title_start) {
         title_start += 6;
         while (*title_start == ' ' || *title_start == '"') title_start++;
