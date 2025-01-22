@@ -14,6 +14,7 @@
 #include "utils/vector.h"
 #include "utils/path.h"
 #include "utils/mmap.h"
+#include "utils/io.h"
 
 #define TEMPLATE_PATH "templates/default.html"
 #define CACHE_FILE ".cssg_cache"
@@ -22,17 +23,24 @@ static void collect_markdown_files(const char* input_dir, FileVector* files);
 static void process_files_parallel(FileVector* files, const char* output_dir, 
                                   BuildCache* global_cache, BuildMetrics* metrics,
                                   const char* input_base);
-static void process_file(Arena* arena, const char* input_path, const char* output_path, BuildCache* cache);
+static void process_file(Arena* process_arena, Arena* batch_arena,
+                        const char* input_path, const char* output_path,
+                        BuildCache* cache, WriteBatch* batch);
 static char* render_template(Arena* arena, const char* template, const FrontMatter* fm, const char* content);
 // static char* read_entire_file(const char* path, size_t* len);
 static void log_metrics(const BuildMetrics* metrics);
 static void load_template(void);
 static void unload_template(void);
+static char* generate_output_path(const char* base, const char* input, const char* output_dir);
+static void ensure_directory_exists(const char* filepath);
 
 // Global thread-local cache
 static MappedFile global_template = {0};
 static BuildCache thread_cache;
 #pragma omp threadprivate(thread_cache)
+
+// static WriteBatch thread_batch;
+// #pragma omp threadprivate(thread_batch)
 
 int main(int argc, char** argv) {
     load_template();
@@ -59,6 +67,9 @@ int main(int argc, char** argv) {
 
     clock_t start = clock();
     process_files_parallel(&files, argv[2], &global_cache, &metrics, argv[1]);
+
+    // batch_flush(&thread_batch);
+
     metrics.total_time = (double)(clock() - start) / CLOCKS_PER_SEC;
 
     metrics.total_files = files.count;
@@ -67,6 +78,7 @@ int main(int argc, char** argv) {
     cache_purge_missing(&global_cache);
     cache_save(&global_cache, CACHE_FILE);
     
+
     vec_free(&files);
     cache_free(&global_cache);
     arena_free(&arena);
@@ -181,11 +193,15 @@ static void process_files_parallel(FileVector* files, const char* output_dir,
                                   const char* input_base) {
     #pragma omp parallel
     {
+        WriteBatch local_batch = {0};
+
         Arena thread_arena;
+        Arena batch_arena;
         BuildCache thread_cache;
         arena_init(&thread_arena, 1024 * 1024);
+        arena_init(&batch_arena, 64 * 1024 * 1024);  // Larger arena
         cache_init(&thread_cache, 64);
-        size_t local_built = 0;  // Thread-local counter
+        size_t local_built = 0;
 
         #pragma omp for schedule(dynamic)
         for (size_t i = 0; i < files->count; i++) {
@@ -195,14 +211,13 @@ static void process_files_parallel(FileVector* files, const char* output_dir,
             const char* relative_path = input_path + strlen(input_base);
             if (*relative_path == '/') relative_path++;
 
-            // Build output path
-            char output_path[PATH_MAX];
-            snprintf(output_path, sizeof(output_path), "%s/%.*s.html",
-                    output_dir,
-                    (int)(strlen(relative_path) - 3),  // Remove .md extension
-                    relative_path);
+            // Generate output path
+            char* base = strip_extension(relative_path);
+            char* output_path = generate_output_path(input_base, files->items[i], output_dir);
+            ensure_directory_exists(output_path);
+            free(base);
 
-            // Check rebuild needs using global cache
+            // Check rebuild needs
             int should_rebuild = 0;
             #pragma omp critical
             {
@@ -210,16 +225,16 @@ static void process_files_parallel(FileVector* files, const char* output_dir,
             }
 
             if (should_rebuild) {
-                process_file(&thread_arena, input_path, output_path, &thread_cache);
+                process_file(&thread_arena, &batch_arena, input_path, output_path, &thread_cache, &local_batch);
                 local_built++;
             }
         }
+        
+        batch_flush(&local_batch);
 
-        // Update metrics atomically
         #pragma omp atomic
         metrics->built_files += local_built;
 
-        // Merge caches
         #pragma omp critical
         {
             for (size_t i = 0; i < thread_cache.count; i++) {
@@ -232,11 +247,42 @@ static void process_files_parallel(FileVector* files, const char* output_dir,
         }
 
         arena_free(&thread_arena);
+        arena_free(&batch_arena);
         cache_free(&thread_cache);
     }
 }
-static void process_file(Arena* arena, const char* input_path, 
-                        const char* output_path, BuildCache* cache) {
+
+static char* generate_output_path(const char* base, const char* input, const char* output_dir) {
+    const char* rel_path = input + strlen(base);
+    if (*rel_path == '/') rel_path++;
+    
+    // Handle files without .md extension
+    char* copy = strdup(rel_path);
+    char* dot = strrchr(copy, '.');
+    if (dot && strcmp(dot, ".md") == 0) {
+        *dot = '\0';
+    }
+    
+    char* path = malloc(PATH_MAX);
+    snprintf(path, PATH_MAX, "%s/%s.html", output_dir, copy);
+    free(copy);
+    
+    return path;
+}
+
+static void ensure_directory_exists(const char* filepath) {
+    char* dir = strdup(filepath);
+    char* slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = '\0';
+        mkpath(dir, 0755);
+    }
+    free(dir);
+}
+
+static void process_file(Arena* process_arena, Arena* batch_arena,
+                        const char* input_path, const char* output_path,
+                        BuildCache* cache, WriteBatch* batch) {
     // Map input file
     MappedFile input = mmap_file(input_path);
     if (!input.data) {
@@ -245,7 +291,7 @@ static void process_file(Arena* arena, const char* input_path,
     }
 
     // Parse markdown directly from memory
-    MarkdownDoc doc = parse_markdown(arena, input.data, input.size);
+    MarkdownDoc doc = parse_markdown(process_arena, input.data, input.size);
     munmap_file(input);
 
     // Use cached template
@@ -255,15 +301,14 @@ static void process_file(Arena* arena, const char* input_path,
     }
 
     // Render using template in memory
-    char* html = render_template(arena, global_template.data, 
+    char* html = render_template(process_arena, global_template.data, 
                                &doc.frontmatter, doc.html);
 
-    // Write output
-    FILE* f = fopen(output_path, "w");
-    if (f) {
-        fwrite(html, 1, strlen(html), f);
-        fclose(f);
-    }
+    
+    size_t html_len = strlen(html);
+    char* html_copy = arena_alloc(batch_arena, html_len + 1);
+    memcpy(html_copy, html, html_len + 1);
+    batch_add(batch, output_path, html_copy, html_len);
 
     // Update cache
     struct stat st;
@@ -272,7 +317,7 @@ static void process_file(Arena* arena, const char* input_path,
                        st.st_mtime, file_hash(input_path));
     }
 
-    arena_reset(arena);
+    arena_reset(process_arena);
 }
 
 

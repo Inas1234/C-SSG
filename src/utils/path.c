@@ -6,11 +6,13 @@
 #include <unistd.h>
 #include <stdio.h>
 
-const char* strip_extension(const char* filename) {
+char* strip_extension(const char* filename) {
     char* copy = strdup(filename);
     char* dot = strrchr(copy, '.');
-    if (dot) *dot = '\0';
-    return copy;
+    if (dot && strcmp(dot, ".md") == 0) {  // Only remove .md extensions
+        *dot = '\0';
+    }
+    return copy;  // Caller must free
 }
 
 const char* get_filename(const char* path) {
