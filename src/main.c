@@ -9,10 +9,14 @@
 
 #include "arena.h"
 #include "parser/markdown.h"
+#include "utils/cache.h"
 
 #define TEMPLATE_PATH "templates/default.html"
 #define PATH_MAX 4096
 
+
+static const char* CACHE_FILE = ".cssg_cache";
+static BuildCache cache;
 
 static void process_directory(Arena* arena, const char* input_dir, const char* output_dir);
 static void process_entry(Arena* arena, const char* base_in, const char* base_out, const char* entry_name);
@@ -102,49 +106,40 @@ static void process_directory(Arena* arena, const char* input_dir, const char* o
 
 
 char* render_template(Arena* arena, const char* template, const FrontMatter* fm, const char* content) {
-    // Replace title
     char* current = strstr(template, "{{title}}");
     if (!current) return NULL;
     
     size_t before_title = current - template;
     size_t title_len = fm->title ? strlen(fm->title) : 0;
     
-    // Replace content
-    char* content_placeholder = strstr(current + 9, "{{content}}"); // 8 = strlen("{{title}}")
+    char* content_placeholder = strstr(current + 9, "{{content}}"); 
     if (!content_placeholder) return NULL;
     
     size_t between_len = content_placeholder - (current + 9);
     size_t content_len = content ? strlen(content) : 0;
-    size_t after_content = strlen(content_placeholder + 11); // 10 = strlen("{{content}}")
+    size_t after_content = strlen(content_placeholder + 11);
 
-    // Calculate total size
     size_t total_size = before_title + title_len + between_len + content_len + after_content + 1;
     char* output = arena_alloc(arena, total_size);
 
-    // Build output
     char* ptr = output;
     
-    // Before title
     memcpy(ptr, template, before_title);
     ptr += before_title;
     
-    // Title
     if (fm->title) {
         memcpy(ptr, fm->title, title_len);
         ptr += title_len;
     }
     
-    // Between placeholders
     memcpy(ptr, current + 9, between_len);
     ptr += between_len;
     
-    // Content
     if (content) {
         memcpy(ptr, content, content_len);
         ptr += content_len;
     }
     
-    // After content
     memcpy(ptr, content_placeholder + 11, after_content);
     
     return output;
@@ -169,7 +164,27 @@ static char* read_entire_file(const char* path, size_t* len) {
 }
 
 static void process_file(Arena* arena, const char* input_path, const char* output_path) {
-    // Read and parse Markdown
+    struct stat st;
+    if (stat(input_path, &st) != 0) {
+        fprintf(stderr, "Error reading %s\n", input_path);
+        return;
+    }
+
+    uint64_t current_hash = file_hash(input_path);
+    if (cache_contains(&cache, input_path)){
+        for (size_t i = 0; i < cache.count; i++) {
+            CacheEntry* e = &cache.entries[i];
+
+            if (strcmp(e->input_path, input_path) == 0) {
+                if (e->last_modified == st.st_mtimespec.tv_sec && e->content_hash == current_hash) {
+                    return;
+                }
+                break;
+            }
+        }
+    }
+
+
     size_t md_len;
     char* md_content = read_entire_file(input_path, &md_len);
     if (!md_content) {
@@ -180,7 +195,6 @@ static void process_file(Arena* arena, const char* input_path, const char* outpu
     MarkdownDoc doc = parse_markdown(arena, md_content, md_len);
     free(md_content);
 
-    // Read template
     size_t template_len;
     char* template = read_entire_file(TEMPLATE_PATH, &template_len);
     if (!template) {
@@ -188,17 +202,14 @@ static void process_file(Arena* arena, const char* input_path, const char* outpu
         return;
     }
 
-    // Render HTML
     char* html = render_template(arena, template, &doc.frontmatter, doc.html);
     free(template);
 
-    // Create output directory
     char* dir = strdup(output_path);
     char* parent_dir = dirname(dir);
     create_directory(parent_dir);
     free(dir);
 
-    // Write file
     FILE* f = fopen(output_path, "w");
     if (f) {
         fputs(html, f);
@@ -208,6 +219,8 @@ static void process_file(Arena* arena, const char* input_path, const char* outpu
     }
     
     arena_reset(arena);
+
+    cache_add_entry(&cache, input_path, output_path, st.st_mtimespec.tv_sec, current_hash);
 }
 int main(int argc, char** argv) {
     if (argc < 3) {
@@ -217,11 +230,14 @@ int main(int argc, char** argv) {
 
     Arena arena;
     arena_init(&arena, 1024 * 1024); 
-
-    // process_file(&arena, argv[1], argv[2]);
+    cache_init(&cache, 128);
+    cache_load(&cache, CACHE_FILE);
 
     process_directory(&arena, argv[1], argv[2]);
+    
+    cache_save(&cache, CACHE_FILE);
 
     arena_free(&arena);
+    cache_free(&cache);
     return 0;
 }

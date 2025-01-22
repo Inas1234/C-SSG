@@ -14,7 +14,6 @@ static int parse_frontmatter(char* content, FrontMatter* fm, Arena* arena) {
     char* end = strstr(start + 3, FRONTMATTER_DELIMITER);
     if (!end) return 0;
     
-    // Extract frontmatter block
     *end = '\0';
     char* yaml = start + 3;
     
@@ -43,14 +42,11 @@ MarkdownDoc parse_markdown(Arena* arena, const char* input, size_t len) {
     memcpy(content, input, len);
     content[len] = '\0';
 
-    // Parse frontmatter
     int frontmatter_size = parse_frontmatter(content, &doc.frontmatter, arena);
     
-    // Process Markdown content
     char* md_content = content + frontmatter_size;
     cmark_node* node = cmark_parse_document(md_content, strlen(md_content), CMARK_OPT_DEFAULT);
     
-    // Convert to HTML
     doc.html = cmark_render_html(node, CMARK_OPT_DEFAULT);
     cmark_node_free(node);
     

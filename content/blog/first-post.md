@@ -9,6 +9,7 @@ Features implemented so far:
 - Markdown parsing
 - Directory traversal
 - Template system
+- Test
 
 Next steps:
 

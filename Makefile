@@ -34,7 +34,7 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
 # Utility Targets
 clean:
 	@echo "Cleaning build artifacts"
-	@rm -rf $(OBJ_DIR) $(TARGET)
+	@rm -rf $(OBJ_DIR) $(TARGET) public/*
 
 run: $(TARGET)
 	@./$(TARGET)
