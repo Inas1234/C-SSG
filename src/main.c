@@ -5,114 +5,96 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <libgen.h>
+#include <time.h>
+#include <omp.h>
 
 #include "arena.h"
 #include "parser/markdown.h"
 #include "utils/cache.h"
+#include "utils/vector.h"
+#include "utils/path.h"
 
 #define TEMPLATE_PATH "templates/default.html"
-#define PATH_MAX 4096
+#define CACHE_FILE ".cssg_cache"
 
+static void collect_markdown_files(const char* input_dir, FileVector* files);
+static void process_files_parallel(FileVector* files, const char* output_dir, 
+                                  BuildCache* global_cache, BuildMetrics* metrics,
+                                  const char* input_base);
+static void process_file(Arena* arena, const char* input_path, const char* output_path, BuildCache* cache);
+static char* render_template(Arena* arena, const char* template, const FrontMatter* fm, const char* content);
+static char* read_entire_file(const char* path, size_t* len);
+static void log_metrics(const BuildMetrics* metrics);
 
-static const char* CACHE_FILE = ".cssg_cache";
-static BuildCache cache;
+// Global thread-local cache
+static BuildCache thread_cache;
+#pragma omp threadprivate(thread_cache)
 
-static void process_directory(Arena* arena, const char* input_dir, const char* output_dir, BuildMetrics* metrics);
-static void process_entry(Arena* arena, const char* base_in, const char* base_out, const char* entry_name, BuildMetrics* metrics);
-static void process_file(Arena* arena, const char* input_path, const char* output_dir);
-
-
-const char* strip_extension(const char* filename) {
-    char* dot = strrchr(filename, '.');
-    if (!dot) return filename;
-    *dot = '\0';
-    return filename;
-}
-
-void copy_file(const char* src, const char* dst) {
-    int in_fd = open(src, O_RDONLY);
-    if (in_fd < 0) return;
-
-    int out_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (out_fd < 0) {
-        close(in_fd);
-        return;
+int main(int argc, char** argv) {
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <input-dir> <output-dir>\n", argv[0]);
+        return 1;
     }
 
-    char buf[4096];
-    ssize_t bytes_read;
-    while ((bytes_read = read(in_fd, buf, sizeof(buf))) > 0) {
-        write(out_fd, buf, bytes_read);
-    }
+    omp_set_num_threads(8);
 
-    close(in_fd);
-    close(out_fd);
-}
+    Arena arena;
+    BuildCache global_cache;
+    FileVector files;
+    BuildMetrics metrics = {0};
 
-static void create_directory(const char* path) {
-    struct stat st = {0};
-    if (stat(path, &st) == -1) {
-        mkdir(path, 0755);
-    }
-}
+    arena_init(&arena, 1024 * 1024);
+    cache_init(&global_cache, 128);
+    vec_init(&files);
 
-static void process_entry(Arena* arena, const char* base_in, 
-                         const char* base_out, const char* entry_name,
-                         BuildMetrics* metrics) {  // Add metrics parameter
-    char in_path[PATH_MAX];
-    char out_path[PATH_MAX];
+    cache_load(&global_cache, CACHE_FILE);
+    collect_markdown_files(argv[1], &files);
+    create_directory(argv[2]); 
+    copy_directory_structure(argv[1], argv[2]);
+
+    clock_t start = clock();
+    process_files_parallel(&files, argv[2], &global_cache, &metrics, argv[1]);
+    metrics.total_time = (double)(clock() - start) / CLOCKS_PER_SEC;
+
+    metrics.total_files = files.count;
+    log_metrics(&metrics);
+
+    cache_purge_missing(&global_cache);
+    cache_save(&global_cache, CACHE_FILE);
     
-    snprintf(in_path, sizeof(in_path), "%s/%s", base_in, entry_name);
-    snprintf(out_path, sizeof(out_path), "%s/%s", base_out, entry_name);
+    vec_free(&files);
+    cache_free(&global_cache);
+    arena_free(&arena);
 
-    struct stat st;
-    if (lstat(in_path, &st) != 0) return;
-
-    if (S_ISDIR(st.st_mode)) {
-        process_directory(arena, in_path, out_path, metrics);
-    } else if (S_ISREG(st.st_mode)) {
-        const char* ext = strrchr(entry_name, '.');  // Declare ext here
-        char out_file[PATH_MAX];  // Declare out_file in this scope
-
-        metrics->total_files++;
-        
-        if (ext && strcmp(ext, ".md") == 0) {
-            // Generate output path
-            snprintf(out_file, sizeof(out_file), "%s/%s.html", 
-                    base_out, strip_extension(entry_name));
-            
-            if (needs_rebuild(in_path, out_file, cache)) {
-                process_file(arena, in_path, out_file);
-                metrics->built_files++;
-            }
-        } else {
-            if (needs_copy(in_path, out_path)) {
-                copy_file(in_path, out_path);
-                metrics->copied_files++;
-            }
-        }
-    }
+    return 0;
 }
-static void process_directory(Arena* arena, const char* input_dir, const char* output_dir, BuildMetrics* metrics) {
-    create_directory(output_dir);
-    
+
+// Directory traversal implementation
+static void collect_markdown_files(const char* input_dir, FileVector* files) {
     DIR* dir = opendir(input_dir);
-    if (!dir) {
-        fprintf(stderr, "Error opening directory: %s\n", input_dir);
-        return;
-    }
+    if (!dir) return;
 
     struct dirent* entry;
     while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;  // Skip hidden files
-        
-        process_entry(arena, input_dir, output_dir, entry->d_name, metrics);
+        if (entry->d_name[0] == '.') continue;
+
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", input_dir, entry->d_name);
+
+        struct stat st;
+        if (lstat(path, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            collect_markdown_files(path, files);
+        } else if (S_ISREG(st.st_mode)) {
+            const char* ext = strrchr(entry->d_name, '.');
+            if (ext && strcmp(ext, ".md") == 0) {
+                vec_push(files, path);
+            }
+        }
     }
-    
     closedir(dir);
 }
-
 
 
 char* render_template(Arena* arena, const char* template, const FrontMatter* fm, const char* content) {
@@ -155,7 +137,6 @@ char* render_template(Arena* arena, const char* template, const FrontMatter* fm,
     return output;
 }
 
-
 static char* read_entire_file(const char* path, size_t* len) {
     FILE* f = fopen(path, "rb");
     if (!f) return NULL;
@@ -173,28 +154,66 @@ static char* read_entire_file(const char* path, size_t* len) {
     return buffer;
 }
 
-static void process_file(Arena* arena, const char* input_path, const char* output_path) {
-    struct stat st;
-    if (stat(input_path, &st) != 0) {
-        fprintf(stderr, "Error reading %s\n", input_path);
-        return;
-    }
+static void process_files_parallel(FileVector* files, const char* output_dir,
+                                  BuildCache* global_cache, BuildMetrics* metrics,
+                                  const char* input_base) {
+    #pragma omp parallel
+    {
+        Arena thread_arena;
+        BuildCache thread_cache;
+        arena_init(&thread_arena, 1024 * 1024);
+        cache_init(&thread_cache, 64);
+        size_t local_built = 0;  // Thread-local counter
 
-    uint64_t current_hash = file_hash(input_path);
-    if (cache_contains(&cache, input_path)){
-        for (size_t i = 0; i < cache.count; i++) {
-            CacheEntry* e = &cache.entries[i];
+        #pragma omp for schedule(dynamic)
+        for (size_t i = 0; i < files->count; i++) {
+            const char* input_path = files->items[i];
+            
+            // Calculate relative path
+            const char* relative_path = input_path + strlen(input_base);
+            if (*relative_path == '/') relative_path++;
 
-            if (strcmp(e->input_path, input_path) == 0) {
-                if (e->last_modified == st.st_mtimespec.tv_sec && e->content_hash == current_hash) {
-                    return;
-                }
-                break;
+            // Build output path
+            char output_path[PATH_MAX];
+            snprintf(output_path, sizeof(output_path), "%s/%.*s.html",
+                    output_dir,
+                    (int)(strlen(relative_path) - 3),  // Remove .md extension
+                    relative_path);
+
+            // Check rebuild needs using global cache
+            int should_rebuild = 0;
+            #pragma omp critical
+            {
+                should_rebuild = needs_rebuild(input_path, output_path, global_cache);
+            }
+
+            if (should_rebuild) {
+                process_file(&thread_arena, input_path, output_path, &thread_cache);
+                local_built++;
             }
         }
+
+        // Update metrics atomically
+        #pragma omp atomic
+        metrics->built_files += local_built;
+
+        // Merge caches
+        #pragma omp critical
+        {
+            for (size_t i = 0; i < thread_cache.count; i++) {
+                cache_update_entry(global_cache,
+                                 thread_cache.entries[i].input_path,
+                                 thread_cache.entries[i].output_path,
+                                 thread_cache.entries[i].last_modified,
+                                 thread_cache.entries[i].content_hash);
+            }
+        }
+
+        arena_free(&thread_arena);
+        cache_free(&thread_cache);
     }
-
-
+}
+static void process_file(Arena* arena, const char* input_path, const char* output_path, BuildCache* cache) {
     size_t md_len;
     char* md_content = read_entire_file(input_path, &md_len);
     if (!md_content) {
@@ -215,64 +234,28 @@ static void process_file(Arena* arena, const char* input_path, const char* outpu
     char* html = render_template(arena, template, &doc.frontmatter, doc.html);
     free(template);
 
-    char* dir = strdup(output_path);
-    char* parent_dir = dirname(dir);
-    create_directory(parent_dir);
-    free(dir);
-
     FILE* f = fopen(output_path, "w");
     if (f) {
         fputs(html, f);
         fclose(f);
     } else {
-        fprintf(stderr, "Error writing %s\n", output_path);
+        perror("Failed to write output file");
     }
-    
-    arena_reset(arena);
+    // Update cache
+    struct stat st;
+    if (stat(input_path, &st) == 0) {
+        cache_add_entry(cache, input_path, output_path, st.st_mtime, file_hash(input_path));
+    }
 
-    cache_add_entry(&cache, input_path, output_path, st.st_mtimespec.tv_sec, current_hash);
+    arena_reset(arena);
 }
 
 void log_metrics(const BuildMetrics* metrics) {
     printf("\nBuild Report:\n"
            "  Total files:   %zu\n"
            "  Rebuilt:       %zu\n"
-           "  Copied:        %zu\n"
            "  Time elapsed:  %.2fms\n\n",
-           metrics->total_files, 
+           metrics->total_files,
            metrics->built_files,
-           metrics->copied_files,
            metrics->total_time * 1000);
-}
-
-
-
-
-int main(int argc, char** argv) {
-    if (argc < 3) {
-        printf("Usage: %s <input-dir> <output-dir>\n", argv[0]);
-        return 1;
-    }
-
-    Arena arena;
-    arena_init(&arena, 1024 * 1024); 
-    cache_init(&cache, 128);
-    cache_load(&cache, CACHE_FILE);
-    BuildMetrics metrics = {0};
-    clock_t start = clock();
-
-    process_directory(&arena, argv[1], argv[2], &metrics);
-
-
-    cache_purge_missing(&cache);
-    cache_save(&cache, CACHE_FILE);
-    cache_free(&cache);
-
-    clock_t end = clock();
-    double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
-    metrics.total_time = elapsed;
-    log_metrics(&metrics);
-
-    arena_free(&arena);
-    return 0;
 }

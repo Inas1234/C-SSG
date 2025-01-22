@@ -9,8 +9,11 @@ OBJECTS     := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SOURCES))
 
 # Compiler Configuration
 CC          := gcc
-CFLAGS      := -Wall -Wextra -Werror -pedantic -std=c11 -O2 -Iinclude -I/opt/homebrew/Cellar/cmark/0.31.1/include/ -DREPORT_INTERVAL=0.5
-LDFLAGS     := -lm $(shell pkg-config --libs libcmark)
+CFLAGS      := -Wall -Wextra -Werror -pedantic -std=c11 -O2 -Iinclude -I/opt/homebrew/Cellar/cmark/0.31.1/include/ -DREPORT_INTERVAL=0.5 \
+				-Xpreprocessor -fopenmp  -Wno-pedantic \
+				-I/opt/homebrew/Cellar/libomp/19.1.7/include/ 
+LDFLAGS     := -lm $(shell pkg-config --libs libcmark) -L/opt/homebrew/opt/libomp/lib -lomp \
+          -L/opt/homebrew/Cellar/cmark/0.31.1/lib \
 
 # Development vs Release
 ifeq ($(DEBUG),1)
@@ -34,7 +37,7 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
 # Utility Targets
 clean:
 	@echo "Cleaning build artifacts"
-	@rm -rf $(OBJ_DIR) $(TARGET) public/*
+	@rm -rf $(OBJ_DIR) $(TARGET) public/* .cssg_cache
 
 run: $(TARGET)
 	@./$(TARGET)
