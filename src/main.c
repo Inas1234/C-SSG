@@ -36,7 +36,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    omp_set_num_threads(8);
+    omp_set_num_threads(omp_get_max_threads());
 
     Arena arena;
     BuildCache global_cache;

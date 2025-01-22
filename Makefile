@@ -37,10 +37,14 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
 # Utility Targets
 clean:
 	@echo "Cleaning build artifacts"
-	@rm -rf $(OBJ_DIR) $(TARGET) public/* .cssg_cache
+	@rm -rf $(OBJ_DIR) $(TARGET) public/* .cssg_cache test_files/output
 
 run: $(TARGET)
 	@./$(TARGET)
+
+
+test: $(TARGET)
+	@./$(TARGET) test_files/content test_files/output
 
 help:
 	@echo "Available targets:"
