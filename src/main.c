@@ -13,6 +13,7 @@
 #include "utils/cache.h"
 #include "utils/vector.h"
 #include "utils/path.h"
+#include "utils/mmap.h"
 
 #define TEMPLATE_PATH "templates/default.html"
 #define CACHE_FILE ".cssg_cache"
@@ -23,14 +24,18 @@ static void process_files_parallel(FileVector* files, const char* output_dir,
                                   const char* input_base);
 static void process_file(Arena* arena, const char* input_path, const char* output_path, BuildCache* cache);
 static char* render_template(Arena* arena, const char* template, const FrontMatter* fm, const char* content);
-static char* read_entire_file(const char* path, size_t* len);
+// static char* read_entire_file(const char* path, size_t* len);
 static void log_metrics(const BuildMetrics* metrics);
+static void load_template(void);
+static void unload_template(void);
 
 // Global thread-local cache
+static MappedFile global_template = {0};
 static BuildCache thread_cache;
 #pragma omp threadprivate(thread_cache)
 
 int main(int argc, char** argv) {
+    load_template();
     if (argc < 3) {
         fprintf(stderr, "Usage: %s <input-dir> <output-dir>\n", argv[0]);
         return 1;
@@ -65,11 +70,28 @@ int main(int argc, char** argv) {
     vec_free(&files);
     cache_free(&global_cache);
     arena_free(&arena);
-
+    unload_template();
     return 0;
 }
 
-// Directory traversal implementation
+
+static void load_template() {
+    global_template = mmap_file(TEMPLATE_PATH);
+    if (global_template.data) {
+        char* copy = malloc(global_template.size + 1);
+        memcpy(copy, global_template.data, global_template.size);
+        copy[global_template.size] = '\0';
+        global_template.data = copy;
+    }
+}
+
+static void unload_template() {
+    if (global_template.data) {
+        free((void*)global_template.data);
+        global_template.data = NULL;
+    }
+}
+
 static void collect_markdown_files(const char* input_dir, FileVector* files) {
     DIR* dir = opendir(input_dir);
     if (!dir) return;
@@ -137,22 +159,22 @@ char* render_template(Arena* arena, const char* template, const FrontMatter* fm,
     return output;
 }
 
-static char* read_entire_file(const char* path, size_t* len) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return NULL;
+// static char* read_entire_file(const char* path, size_t* len) {
+//     FILE* f = fopen(path, "rb");
+//     if (!f) return NULL;
     
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
+//     fseek(f, 0, SEEK_END);
+//     long size = ftell(f);
+//     fseek(f, 0, SEEK_SET);
     
-    char* buffer = malloc(size + 1);
-    fread(buffer, 1, size, f);
-    buffer[size] = '\0';
+//     char* buffer = malloc(size + 1);
+//     fread(buffer, 1, size, f);
+//     buffer[size] = '\0';
     
-    fclose(f);
-    *len = size;
-    return buffer;
-}
+//     fclose(f);
+//     *len = size;
+//     return buffer;
+// }
 
 static void process_files_parallel(FileVector* files, const char* output_dir,
                                   BuildCache* global_cache, BuildMetrics* metrics,
@@ -213,42 +235,46 @@ static void process_files_parallel(FileVector* files, const char* output_dir,
         cache_free(&thread_cache);
     }
 }
-static void process_file(Arena* arena, const char* input_path, const char* output_path, BuildCache* cache) {
-    size_t md_len;
-    char* md_content = read_entire_file(input_path, &md_len);
-    if (!md_content) {
-        fprintf(stderr, "Error reading %s\n", input_path);
+static void process_file(Arena* arena, const char* input_path, 
+                        const char* output_path, BuildCache* cache) {
+    // Map input file
+    MappedFile input = mmap_file(input_path);
+    if (!input.data) {
+        fprintf(stderr, "Error mapping %s\n", input_path);
         return;
     }
 
-    MarkdownDoc doc = parse_markdown(arena, md_content, md_len);
-    free(md_content);
+    // Parse markdown directly from memory
+    MarkdownDoc doc = parse_markdown(arena, input.data, input.size);
+    munmap_file(input);
 
-    size_t template_len;
-    char* template = read_entire_file(TEMPLATE_PATH, &template_len);
-    if (!template) {
-        fprintf(stderr, "Template not found: %s\n", TEMPLATE_PATH);
+    // Use cached template
+    if (!global_template.data) {
+        fprintf(stderr, "Template not loaded\n");
         return;
     }
 
-    char* html = render_template(arena, template, &doc.frontmatter, doc.html);
-    free(template);
+    // Render using template in memory
+    char* html = render_template(arena, global_template.data, 
+                               &doc.frontmatter, doc.html);
 
+    // Write output
     FILE* f = fopen(output_path, "w");
     if (f) {
-        fputs(html, f);
+        fwrite(html, 1, strlen(html), f);
         fclose(f);
-    } else {
-        perror("Failed to write output file");
     }
+
     // Update cache
     struct stat st;
     if (stat(input_path, &st) == 0) {
-        cache_add_entry(cache, input_path, output_path, st.st_mtime, file_hash(input_path));
+        cache_add_entry(cache, input_path, output_path, 
+                       st.st_mtime, file_hash(input_path));
     }
 
     arena_reset(arena);
 }
+
 
 void log_metrics(const BuildMetrics* metrics) {
     printf("\nBuild Report:\n"
