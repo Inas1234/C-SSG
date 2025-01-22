@@ -9,7 +9,7 @@ OBJECTS     := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SOURCES))
 
 # Compiler Configuration
 CC          := gcc
-CFLAGS      := -Wall -Wextra -Werror -pedantic -std=c11 -O2 -Iinclude -I/opt/homebrew/Cellar/cmark/0.31.1/include/
+CFLAGS      := -Wall -Wextra -Werror -pedantic -std=c11 -O2 -Iinclude -I/opt/homebrew/Cellar/cmark/0.31.1/include/ -DREPORT_INTERVAL=0.5
 LDFLAGS     := -lm $(shell pkg-config --libs libcmark)
 
 # Development vs Release

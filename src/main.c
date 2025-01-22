@@ -18,8 +18,8 @@
 static const char* CACHE_FILE = ".cssg_cache";
 static BuildCache cache;
 
-static void process_directory(Arena* arena, const char* input_dir, const char* output_dir);
-static void process_entry(Arena* arena, const char* base_in, const char* base_out, const char* entry_name);
+static void process_directory(Arena* arena, const char* input_dir, const char* output_dir, BuildMetrics* metrics);
+static void process_entry(Arena* arena, const char* base_in, const char* base_out, const char* entry_name, BuildMetrics* metrics);
 static void process_file(Arena* arena, const char* input_path, const char* output_dir);
 
 
@@ -57,7 +57,9 @@ static void create_directory(const char* path) {
     }
 }
 
-static void process_entry(Arena* arena, const char* base_in, const char* base_out, const char* entry_name) {
+static void process_entry(Arena* arena, const char* base_in, 
+                         const char* base_out, const char* entry_name,
+                         BuildMetrics* metrics) {  // Add metrics parameter
     char in_path[PATH_MAX];
     char out_path[PATH_MAX];
     
@@ -68,23 +70,31 @@ static void process_entry(Arena* arena, const char* base_in, const char* base_ou
     if (lstat(in_path, &st) != 0) return;
 
     if (S_ISDIR(st.st_mode)) {
-        process_directory(arena, in_path, out_path);
+        process_directory(arena, in_path, out_path, metrics);
     } else if (S_ISREG(st.st_mode)) {
-        const char* ext = strrchr(entry_name, '.');
+        const char* ext = strrchr(entry_name, '.');  // Declare ext here
+        char out_file[PATH_MAX];  // Declare out_file in this scope
+
+        metrics->total_files++;
+        
         if (ext && strcmp(ext, ".md") == 0) {
-            char out_file[PATH_MAX];
+            // Generate output path
             snprintf(out_file, sizeof(out_file), "%s/%s.html", 
                     base_out, strip_extension(entry_name));
             
-            process_file(arena, in_path, out_file);
+            if (needs_rebuild(in_path, out_file, cache)) {
+                process_file(arena, in_path, out_file);
+                metrics->built_files++;
+            }
         } else {
-            // Copy non-Markdown files
-            copy_file(in_path, out_path);
+            if (needs_copy(in_path, out_path)) {
+                copy_file(in_path, out_path);
+                metrics->copied_files++;
+            }
         }
     }
 }
-
-static void process_directory(Arena* arena, const char* input_dir, const char* output_dir) {
+static void process_directory(Arena* arena, const char* input_dir, const char* output_dir, BuildMetrics* metrics) {
     create_directory(output_dir);
     
     DIR* dir = opendir(input_dir);
@@ -97,7 +107,7 @@ static void process_directory(Arena* arena, const char* input_dir, const char* o
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.') continue;  // Skip hidden files
         
-        process_entry(arena, input_dir, output_dir, entry->d_name);
+        process_entry(arena, input_dir, output_dir, entry->d_name, metrics);
     }
     
     closedir(dir);
@@ -222,6 +232,22 @@ static void process_file(Arena* arena, const char* input_path, const char* outpu
 
     cache_add_entry(&cache, input_path, output_path, st.st_mtimespec.tv_sec, current_hash);
 }
+
+void log_metrics(const BuildMetrics* metrics) {
+    printf("\nBuild Report:\n"
+           "  Total files:   %zu\n"
+           "  Rebuilt:       %zu\n"
+           "  Copied:        %zu\n"
+           "  Time elapsed:  %.2fms\n\n",
+           metrics->total_files, 
+           metrics->built_files,
+           metrics->copied_files,
+           metrics->total_time * 1000);
+}
+
+
+
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         printf("Usage: %s <input-dir> <output-dir>\n", argv[0]);
@@ -232,12 +258,21 @@ int main(int argc, char** argv) {
     arena_init(&arena, 1024 * 1024); 
     cache_init(&cache, 128);
     cache_load(&cache, CACHE_FILE);
+    BuildMetrics metrics = {0};
+    clock_t start = clock();
 
-    process_directory(&arena, argv[1], argv[2]);
-    
+    process_directory(&arena, argv[1], argv[2], &metrics);
+
+
+    cache_purge_missing(&cache);
     cache_save(&cache, CACHE_FILE);
+    cache_free(&cache);
+
+    clock_t end = clock();
+    double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
+    metrics.total_time = elapsed;
+    log_metrics(&metrics);
 
     arena_free(&arena);
-    cache_free(&cache);
     return 0;
 }

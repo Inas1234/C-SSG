@@ -141,3 +141,33 @@ uint64_t file_hash(const char* path) {
     
     return (st.st_size << 32) | (st.st_mtime & 0xFFFFFFFF);
 }
+
+
+// Add these functions after cache_load
+void cache_purge_missing(BuildCache* cache) {
+    size_t new_count = 0;
+    for (size_t i = 0; i < cache->count; i++) {
+        struct stat st;
+        if (stat(cache->entries[i].input_path, &st) == 0) {
+            cache->entries[new_count++] = cache->entries[i];
+        } else {
+            free(cache->entries[i].input_path);
+            free(cache->entries[i].output_path);
+        }
+    }
+    cache->count = new_count;
+}
+
+void cache_update_entry(BuildCache* cache, const char* in_path,
+                       const char* out_path, time_t mtime, uint64_t hash) {
+    for (size_t i = 0; i < cache->count; i++) {
+        if (strcmp(cache->entries[i].input_path, in_path) == 0) {
+            free(cache->entries[i].output_path);
+            cache->entries[i].output_path = strdup(out_path);
+            cache->entries[i].last_modified = mtime;
+            cache->entries[i].content_hash = hash;
+            return;
+        }
+    }
+    cache_add_entry(cache, in_path, out_path, mtime, hash);
+}
