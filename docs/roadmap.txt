@@ -1,0 +1,7 @@
+Example Roadmap
+Phase	Milestone
+1	Core Markdown parser + single-threaded rendering
+2	Multithreaded pipeline + incremental builds
+3	Template engine + asset optimization
+4	Plugin system + CLI tooling
+5	Performance tuning + cross-platform testing
