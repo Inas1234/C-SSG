@@ -15,9 +15,21 @@
 #include "utils/path.h"
 #include "utils/mmap.h"
 #include "utils/io.h"
+#include "utils/simd.h"
 
 #define TEMPLATE_PATH "templates/default.html"
 #define CACHE_FILE ".cssg_cache"
+
+typedef struct {
+    const char* head;
+    size_t head_len;
+    const char* middle;
+    size_t middle_len;
+    const char* tail;
+    size_t tail_len;
+} TemplateParts;
+
+static TemplateParts template_parts;
 
 static void collect_markdown_files(const char* input_dir, FileVector* files);
 static void process_files_parallel(FileVector* files, const char* output_dir, 
@@ -26,21 +38,18 @@ static void process_files_parallel(FileVector* files, const char* output_dir,
 static void process_file(Arena* process_arena, Arena* batch_arena,
                         const char* input_path, const char* output_path,
                         BuildCache* cache, WriteBatch* batch);
-static char* render_template(Arena* arena, const char* template, const FrontMatter* fm, const char* content);
-// static char* read_entire_file(const char* path, size_t* len);
+char* render_template(Arena* arena, const FrontMatter* fm, const char* content);
 static void log_metrics(const BuildMetrics* metrics);
 static void load_template(void);
 static void unload_template(void);
 static char* generate_output_path(const char* base, const char* input, const char* output_dir);
 static void ensure_directory_exists(const char* filepath);
 
-// Global thread-local cache
 static MappedFile global_template = {0};
 static BuildCache thread_cache;
 #pragma omp threadprivate(thread_cache)
 
-// static WriteBatch thread_batch;
-// #pragma omp threadprivate(thread_batch)
+
 
 int main(int argc, char** argv) {
     load_template();
@@ -68,8 +77,6 @@ int main(int argc, char** argv) {
     clock_t start = clock();
     process_files_parallel(&files, argv[2], &global_cache, &metrics, argv[1]);
 
-    // batch_flush(&thread_batch);
-
     metrics.total_time = (double)(clock() - start) / CLOCKS_PER_SEC;
 
     metrics.total_files = files.count;
@@ -95,6 +102,19 @@ static void load_template() {
         copy[global_template.size] = '\0';
         global_template.data = copy;
     }
+
+    char* title_start = simd_strstr((char*)global_template.data, "{{title}}");
+    char* content_start = simd_strstr(title_start + 9, "{{content}}");
+    
+    template_parts.head = global_template.data;
+    template_parts.head_len = title_start - global_template.data;
+    
+    template_parts.middle = title_start + 9;
+    template_parts.middle_len = content_start - template_parts.middle;
+    
+    template_parts.tail = content_start + 11;
+    template_parts.tail_len = global_template.size - (content_start - global_template.data) - 11;
+
 }
 
 static void unload_template() {
@@ -131,62 +151,38 @@ static void collect_markdown_files(const char* input_dir, FileVector* files) {
 }
 
 
-char* render_template(Arena* arena, const char* template, const FrontMatter* fm, const char* content) {
-    char* current = strstr(template, "{{title}}");
-    if (!current) return NULL;
-    
-    size_t before_title = current - template;
+char* render_template(Arena* arena, const FrontMatter* fm, const char* content) {
     size_t title_len = fm->title ? strlen(fm->title) : 0;
-    
-    char* content_placeholder = strstr(current + 9, "{{content}}"); 
-    if (!content_placeholder) return NULL;
-    
-    size_t between_len = content_placeholder - (current + 9);
     size_t content_len = content ? strlen(content) : 0;
-    size_t after_content = strlen(content_placeholder + 11);
 
-    size_t total_size = before_title + title_len + between_len + content_len + after_content + 1;
+    size_t total_size = template_parts.head_len + title_len + 
+                       template_parts.middle_len + content_len + 
+                       template_parts.tail_len + 1;
+    
     char* output = arena_alloc(arena, total_size);
-
     char* ptr = output;
     
-    memcpy(ptr, template, before_title);
-    ptr += before_title;
+    memcpy(ptr, template_parts.head, template_parts.head_len);
+    ptr += template_parts.head_len;
     
     if (fm->title) {
         memcpy(ptr, fm->title, title_len);
         ptr += title_len;
     }
     
-    memcpy(ptr, current + 9, between_len);
-    ptr += between_len;
+    memcpy(ptr, template_parts.middle, template_parts.middle_len);
+    ptr += template_parts.middle_len;
     
     if (content) {
         memcpy(ptr, content, content_len);
         ptr += content_len;
     }
     
-    memcpy(ptr, content_placeholder + 11, after_content);
+    memcpy(ptr, template_parts.tail, template_parts.tail_len);
+    *ptr = '\0';
     
     return output;
 }
-
-// static char* read_entire_file(const char* path, size_t* len) {
-//     FILE* f = fopen(path, "rb");
-//     if (!f) return NULL;
-    
-//     fseek(f, 0, SEEK_END);
-//     long size = ftell(f);
-//     fseek(f, 0, SEEK_SET);
-    
-//     char* buffer = malloc(size + 1);
-//     fread(buffer, 1, size, f);
-//     buffer[size] = '\0';
-    
-//     fclose(f);
-//     *len = size;
-//     return buffer;
-// }
 
 static void process_files_parallel(FileVector* files, const char* output_dir,
                                   BuildCache* global_cache, BuildMetrics* metrics,
@@ -199,7 +195,7 @@ static void process_files_parallel(FileVector* files, const char* output_dir,
         Arena batch_arena;
         BuildCache thread_cache;
         arena_init(&thread_arena, 1024 * 1024);
-        arena_init(&batch_arena, 64 * 1024 * 1024);  // Larger arena
+        arena_init(&batch_arena, 64 * 1024 * 1024);  
         cache_init(&thread_cache, 64);
         size_t local_built = 0;
 
@@ -207,17 +203,14 @@ static void process_files_parallel(FileVector* files, const char* output_dir,
         for (size_t i = 0; i < files->count; i++) {
             const char* input_path = files->items[i];
             
-            // Calculate relative path
             const char* relative_path = input_path + strlen(input_base);
             if (*relative_path == '/') relative_path++;
 
-            // Generate output path
             char* base = strip_extension(relative_path);
             char* output_path = generate_output_path(input_base, files->items[i], output_dir);
             ensure_directory_exists(output_path);
             free(base);
 
-            // Check rebuild needs
             int should_rebuild = 0;
             #pragma omp critical
             {
@@ -256,7 +249,6 @@ static char* generate_output_path(const char* base, const char* input, const cha
     const char* rel_path = input + strlen(base);
     if (*rel_path == '/') rel_path++;
     
-    // Handle files without .md extension
     char* copy = strdup(rel_path);
     char* dot = strrchr(copy, '.');
     if (dot && strcmp(dot, ".md") == 0) {
@@ -283,26 +275,21 @@ static void ensure_directory_exists(const char* filepath) {
 static void process_file(Arena* process_arena, Arena* batch_arena,
                         const char* input_path, const char* output_path,
                         BuildCache* cache, WriteBatch* batch) {
-    // Map input file
     MappedFile input = mmap_file(input_path);
     if (!input.data) {
         fprintf(stderr, "Error mapping %s\n", input_path);
         return;
     }
 
-    // Parse markdown directly from memory
     MarkdownDoc doc = parse_markdown(process_arena, input.data, input.size);
     munmap_file(input);
 
-    // Use cached template
     if (!global_template.data) {
         fprintf(stderr, "Template not loaded\n");
         return;
     }
 
-    // Render using template in memory
-    char* html = render_template(process_arena, global_template.data, 
-                               &doc.frontmatter, doc.html);
+    char* html = render_template(process_arena, &doc.frontmatter, doc.html);
 
     
     size_t html_len = strlen(html);
@@ -310,7 +297,6 @@ static void process_file(Arena* process_arena, Arena* batch_arena,
     memcpy(html_copy, html, html_len + 1);
     batch_add(batch, output_path, html_copy, html_len);
 
-    // Update cache
     struct stat st;
     if (stat(input_path, &st) == 0) {
         cache_add_entry(cache, input_path, output_path, 
