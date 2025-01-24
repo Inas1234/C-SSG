@@ -1,5 +1,5 @@
 # Generate 100 files with sequential content
-for i in {1..100}; do
+for i in {1..1000}; do
   cat <<EOF > test_files/content/doc$i.md
 ---
 title: "Document $i"

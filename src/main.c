@@ -16,8 +16,10 @@
 #include "utils/mmap.h"
 #include "utils/io.h"
 #include "utils/simd.h"
+#include "parser/mlinyaml.h"
 
 #define TEMPLATE_PATH "templates/default.html"
+char *template_path = "templates/default.html";
 #define CACHE_FILE ".cssg_cache"
 
 typedef struct {
@@ -52,11 +54,22 @@ static BuildCache thread_cache;
 
 
 int main(int argc, char** argv) {
-    load_template();
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <input-dir> <output-dir>\n", argv[0]);
+    YamlConfig config = {0};
+    if (parse_yaml(argv[1], &config) != 0) {
+        fprintf(stderr, "Error parsing config file\n");
         return 1;
     }
+
+    if (config.tmpl) {
+        template_path = (char*)config.tmpl;
+    }
+
+    load_template();
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <config-file>\n", argv[0]);
+        return 1;
+    }
+
 
     omp_set_num_threads(omp_get_max_threads());
 
@@ -70,12 +83,12 @@ int main(int argc, char** argv) {
     vec_init(&files);
 
     cache_load(&global_cache, CACHE_FILE);
-    collect_markdown_files(argv[1], &files);
-    create_directory(argv[2]); 
-    copy_directory_structure(argv[1], argv[2]);
+    collect_markdown_files(config.input_dir, &files);
+    create_directory(config.output_dir); 
+    copy_directory_structure(config.input_dir, config.output_dir);
 
     clock_t start = clock();
-    process_files_parallel(&files, argv[2], &global_cache, &metrics, argv[1]);
+    process_files_parallel(&files, config.output_dir, &global_cache, &metrics, config.input_dir);
 
     metrics.total_time = (double)(clock() - start) / CLOCKS_PER_SEC;
 
@@ -95,7 +108,7 @@ int main(int argc, char** argv) {
 
 
 static void load_template() {
-    global_template = mmap_file(TEMPLATE_PATH);
+    global_template = mmap_file(template_path);
     if (global_template.data) {
         char* copy = malloc(global_template.size + 1);
         memcpy(copy, global_template.data, global_template.size);

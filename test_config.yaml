@@ -1,0 +1,3 @@
+input_directory: test_files/content
+output_directory: test_files/output
+template_directory: templates/default.html

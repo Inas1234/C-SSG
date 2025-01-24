@@ -60,7 +60,7 @@ run: $(TARGET)
 	@./$(TARGET)
 
 test: $(TARGET)
-	@./$(TARGET) test_files/content test_files/output
+	@./$(TARGET) test_config.yaml
 
 help:
 	@echo "Available targets:"
