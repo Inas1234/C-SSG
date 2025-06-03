@@ -12,7 +12,7 @@ OBJECTS     := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SOURCES))
 
 # Compiler Configuration
 CC          := gcc
-BASE_CFLAGS := -Wall -Wextra -Werror -pedantic -std=c11 -O2 \
+BASE_CFLAGS := -Wall -Wextra -Werror -pedantic -std=c11 -O3 \
                -Iinclude -DREPORT_INTERVAL=0.5 \
                -I/opt/homebrew/Cellar/cmark/0.31.1/include/ \
                -Xpreprocessor -fopenmp -Wno-pedantic \
