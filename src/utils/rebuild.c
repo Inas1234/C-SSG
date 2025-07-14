@@ -3,33 +3,37 @@
 #include <time.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
 
-int needs_rebuild(const char* in_path, const char* out_path, BuildCache* cache) {
-    struct stat in_stat, out_stat;
-    
-    // Input file check
-    if (stat(in_path, &in_stat) != 0) {
-        fprintf(stderr, "Missing input file: %s\n", in_path);
+int needs_rebuild(const char* input_path, BuildCache* cache) {
+    // 1. Look up the file in the cache.
+    CacheEntry* entry = cache_get(cache, input_path);
+
+    // 2. Cache Miss: If it's not in the cache, it's new. Rebuild.
+    if (!entry) {
+        return 1;
+    }
+
+    // 3. Cache Hit: Get the file's current modification time.
+    struct stat st;
+    if (stat(input_path, &st) != 0) {
+        // The file existed before but is now deleted. Don't build.
+        // The cache_purge_missing() will clean this up later.
         return 0;
     }
 
-    // Output file existence check
-    const int output_exists = (stat(out_path, &out_stat) == 0);
-
-    // Check cache entry
-    for (size_t i = 0; i < cache->count; i++) {
-        if (strcmp(cache->entries[i].input_path, in_path) == 0) {
-            // Validate against current state
-            const int content_changed = (cache->entries[i].content_hash != file_hash(in_path));
-            const int output_missing = !output_exists;
-            const int outdated = output_exists && (in_stat.st_mtime > out_stat.st_mtime);
-            
-            return content_changed || output_missing || outdated;
-        }
+    // 4. Compare modification times. If the file on disk is newer, rebuild.
+    if (st.st_mtime > entry->last_modified) {
+        return 1;
     }
 
-    // No cache entry - needs rebuild
-    return 1;
+    // 5. Check if the output file was deleted manually.
+    if (access(entry->output_path, F_OK) != 0) {
+        return 1; // Output is missing, rebuild.
+    }
+
+    // If we get here, the file is in the cache and is not outdated. Skip it.
+    return 0;
 }
 
 int needs_copy(const char* src, const char* dst) {

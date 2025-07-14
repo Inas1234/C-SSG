@@ -135,13 +135,6 @@ int cache_contains(const BuildCache* cache, const char* path) {
     return 0;
 }
 
-uint64_t file_hash(const char* path) {
-    struct stat st;
-    if (stat(path, &st) != 0) return 0;
-    
-    return (st.st_size << 32) | (st.st_mtime & 0xFFFFFFFF);
-}
-
 
 // Add these functions after cache_load
 void cache_purge_missing(BuildCache* cache) {
@@ -170,4 +163,45 @@ void cache_update_entry(BuildCache* cache, const char* in_path,
         }
     }
     cache_add_entry(cache, in_path, out_path, mtime, hash);
+}
+
+
+CacheEntry* cache_get(BuildCache* cache, const char* input_path) {
+    for (size_t i = 0; i < cache->count; i++) {
+        if (strcmp(cache->entries[i].input_path, input_path) == 0) {
+            return &cache->entries[i];
+        }
+    }
+    return NULL;
+}
+
+uint64_t file_hash(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+
+    uint64_t hash = 0xcbf29ce484222325; // FNV_offset_basis
+    const uint64_t prime = 0x100000001b3; // FNV_prime
+
+    unsigned char buf[4096];
+    size_t bytes_read;
+    while ((bytes_read = fread(buf, 1, sizeof(buf), f))) {
+        for (size_t i = 0; i < bytes_read; i++) {
+            hash ^= buf[i];
+            hash *= prime;
+        }
+    }
+    fclose(f);
+    return hash;
+}
+
+
+uint64_t hash_from_memory(const char* data, size_t size) {
+    uint64_t hash = 0xcbf29ce484222325; // FNV_offset_basis
+    const uint64_t prime = 0x100000001b3; // FNV_prime
+
+    for (size_t i = 0; i < size; i++) {
+        hash ^= data[i];
+        hash *= prime;
+    }
+    return hash;
 }

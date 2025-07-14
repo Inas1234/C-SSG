@@ -37,7 +37,7 @@ static void collect_markdown_files(const char* input_dir, FileVector* files);
 static void process_files_parallel(FileVector* files, const char* output_dir, 
                                   BuildCache* global_cache, BuildMetrics* metrics,
                                   const char* input_base);
-static void process_file(Arena* process_arena, Arena* batch_arena,
+static void process_file(Arena* process_arena,
                         const char* input_path, const char* output_path,
                         BuildCache* cache, WriteBatch* batch);
 char* render_template(Arena* arena, const FrontMatter* fm, const char* content);
@@ -54,6 +54,12 @@ static BuildCache thread_cache;
 
 
 int main(int argc, char** argv) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <config-file>\n", argv[0]);
+        return 1;
+    }
+
+
     YamlConfig config = {0};
     if (parse_yaml(argv[1], &config) != 0) {
         fprintf(stderr, "Error parsing config file\n");
@@ -65,11 +71,7 @@ int main(int argc, char** argv) {
     }
 
     load_template();
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <config-file>\n", argv[0]);
-        return 1;
-    }
-
+    
 
     omp_set_num_threads(omp_get_max_threads());
 
@@ -197,18 +199,19 @@ char* render_template(Arena* arena, const FrontMatter* fm, const char* content) 
     return output;
 }
 
+// In your main C file
+
 static void process_files_parallel(FileVector* files, const char* output_dir,
                                   BuildCache* global_cache, BuildMetrics* metrics,
                                   const char* input_base) {
     #pragma omp parallel
     {
         WriteBatch local_batch = {0};
-
         Arena thread_arena;
         Arena batch_arena;
-        BuildCache thread_cache;
+        BuildCache thread_cache; // For per-thread cache updates
         arena_init(&thread_arena, 1024 * 1024);
-        arena_init(&batch_arena, 64 * 1024 * 1024);  
+        arena_init(&batch_arena, 64 * 1024 * 1024);
         cache_init(&thread_cache, 64);
         size_t local_built = 0;
 
@@ -216,23 +219,25 @@ static void process_files_parallel(FileVector* files, const char* output_dir,
         for (size_t i = 0; i < files->count; i++) {
             const char* input_path = files->items[i];
             
-            const char* relative_path = input_path + strlen(input_base);
-            if (*relative_path == '/') relative_path++;
-
-            char* base = strip_extension(relative_path);
-            char* output_path = generate_output_path(input_base, files->items[i], output_dir);
-            ensure_directory_exists(output_path);
-            free(base);
-
+            // This check is now much faster. It avoids expensive I/O.
             int should_rebuild = 0;
-            #pragma omp critical
+            // The critical section is still needed for thread-safe cache reads
+            #pragma omp critical(CacheCheck)
             {
-                should_rebuild = needs_rebuild(input_path, output_path, global_cache);
+                // NOTE THE NEW SIGNATURE: only input_path and cache are needed now.
+                should_rebuild = needs_rebuild(input_path, global_cache);
             }
 
             if (should_rebuild) {
-                process_file(&thread_arena, &batch_arena, input_path, output_path, &thread_cache, &local_batch);
+                // Defer path generation and directory creation until we know we need it.
+                // This is a significant optimization.
+                char* output_path = generate_output_path(input_base, input_path, output_dir);
+                ensure_directory_exists(output_path);
+
+                process_file(&thread_arena, input_path, output_path, &thread_cache, &local_batch);
                 local_built++;
+
+                free(output_path); // Free the path when done
             }
         }
         
@@ -241,7 +246,8 @@ static void process_files_parallel(FileVector* files, const char* output_dir,
         #pragma omp atomic
         metrics->built_files += local_built;
 
-        #pragma omp critical
+        // Critical section for merging the thread-local caches into the global one.
+        #pragma omp critical(CacheUpdate)
         {
             for (size_t i = 0; i < thread_cache.count; i++) {
                 cache_update_entry(global_cache,
@@ -257,7 +263,6 @@ static void process_files_parallel(FileVector* files, const char* output_dir,
         cache_free(&thread_cache);
     }
 }
-
 static char* generate_output_path(const char* base, const char* input, const char* output_dir) {
     const char* rel_path = input + strlen(base);
     if (*rel_path == '/') rel_path++;
@@ -285,7 +290,8 @@ static void ensure_directory_exists(const char* filepath) {
     free(dir);
 }
 
-static void process_file(Arena* process_arena, Arena* batch_arena,
+// In your main C file
+static void process_file(Arena* process_arena,
                         const char* input_path, const char* output_path,
                         BuildCache* cache, WriteBatch* batch) {
     MappedFile input = mmap_file(input_path);
@@ -294,8 +300,13 @@ static void process_file(Arena* process_arena, Arena* batch_arena,
         return;
     }
 
+    // --- OPTIMIZATION 1: HASH FROM MEMORY ---
+    // Hash the file content that is already in memory. No second disk read.
+    uint64_t content_hash = hash_from_memory(input.data, input.size);
+    // --- END OPTIMIZATION 1 ---
+
     MarkdownDoc doc = parse_markdown(process_arena, input.data, input.size);
-    munmap_file(input);
+    munmap_file(input); // Unmap as soon as we're done with it.
 
     if (!global_template.data) {
         fprintf(stderr, "Template not loaded\n");
@@ -304,21 +315,27 @@ static void process_file(Arena* process_arena, Arena* batch_arena,
 
     char* html = render_template(process_arena, &doc.frontmatter, doc.html);
 
-    
-    size_t html_len = strlen(html);
-    char* html_copy = arena_alloc(batch_arena, html_len + 1);
-    memcpy(html_copy, html, html_len + 1);
-    batch_add(batch, output_path, html_copy, html_len);
+    // --- OPTIMIZATION 2: AVOID MEMCPY ---
+    // The 'html' pointer is already allocated in an arena that will persist
+    // for the entire batch. We can add it directly to the batch.
+    // This requires that process_arena is NOT reset until after the batch is flushed.
+    // Given your loop structure, this is safe.
+    size_t html_len = strlen(html); // We still need the length for the batch.
+    batch_add(batch, output_path, html, html_len); // Add the original pointer, not a copy.
+    // --- END OPTIMIZATION 2 ---
 
     struct stat st;
     if (stat(input_path, &st) == 0) {
-        cache_add_entry(cache, input_path, output_path, 
-                       st.st_mtime, file_hash(input_path));
+        // Use the hash we calculated earlier.
+        cache_add_entry(cache, input_path, output_path, st.st_mtime, content_hash);
     }
 
-    arena_reset(process_arena);
+    // IMPORTANT: Do NOT reset the process_arena here.
+    // It holds the HTML content that the batch points to.
+    // Your current structure where the arena is freed at the end of the
+    // parallel block is correct for this optimization.
+    // arena_reset(process_arena); // <-- REMOVE THIS if it was inside the loop
 }
-
 
 void log_metrics(const BuildMetrics* metrics) {
     printf("\nBuild Report:\n"

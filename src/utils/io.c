@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <omp.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 
 void batch_add(WriteBatch* batch, const char* path, const char* content, size_t size) {
     if (batch->count >= BATCH_SIZE) {
@@ -18,15 +21,15 @@ void batch_add(WriteBatch* batch, const char* path, const char* content, size_t 
 }
 
 void batch_flush(WriteBatch* batch) {
-    #pragma omp parallel for schedule(static)
     for (int i = 0; i < batch->count; i++) {
-        FILE* f = fopen(batch->paths[i], "w");
-        if (f) {
-            fwrite(batch->contents[i], 1, batch->sizes[i], f);
-            fclose(f);
+        int fd = open(batch->paths[i], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd != -1) {
+            write(fd, batch->contents[i], batch->sizes[i]);
+            close(fd);
+        } else {
+            fprintf(stderr, "Failed to open file for writing: %s\n", batch->paths[i]);
         }
-        free((void*)batch->paths[i]);
-        free(batch->contents[i]);
+        
     }
     batch->count = 0;
 }
