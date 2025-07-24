@@ -5,41 +5,42 @@
 #include <stdio.h>
 #include <unistd.h>
 
-int needs_rebuild(const char* input_path, BuildCache* cache) {
-    // 1. Look up the file in the cache.
-    CacheEntry* entry = cache_get(cache, input_path);
+int needs_rebuild(const char* in_path, BuildCache* cache) {
+    CacheEntry* entry = NULL;
 
-    // 2. Cache Miss: If it's not in the cache, it's new. Rebuild.
+    // HASH_FIND_STR is the uthash macro for a fast (O(1) average) lookup.
+    // It searches the hash table pointed to by `*cache` for a key matching `in_path`.
+    // If found, it sets `entry` to point to the found struct.
+    HASH_FIND_STR(*cache, in_path, entry);
+
+    // Case 1: Not in cache. Must be a new file, so rebuild.
     if (!entry) {
         return 1;
     }
 
-    // 3. Cache Hit: Get the file's current modification time.
+    // Case 2: In cache. Check modification time.
     struct stat st;
-    if (stat(input_path, &st) != 0) {
-        // The file existed before but is now deleted. Don't build.
-        // The cache_purge_missing() will clean this up later.
+    if (stat(in_path, &st) != 0) {
+        // Source file was deleted. Don't try to build it.
         return 0;
     }
-
-    // 4. Compare modification times. If the file on disk is newer, rebuild.
     if (st.st_mtime > entry->last_modified) {
-        return 1;
+        return 1; // Source file is newer than our cache record. Rebuild.
     }
 
-    // 5. Check if the output file was deleted manually.
+    // Case 3: Check if the output file was deleted manually.
     if (access(entry->output_path, F_OK) != 0) {
-        return 1; // Output is missing, rebuild.
+        return 1; // Output is missing. Rebuild.
     }
 
-    // If we get here, the file is in the cache and is not outdated. Skip it.
+    // If all checks pass, the file is up-to-date.
     return 0;
 }
 
+
+
 int needs_copy(const char* src, const char* dst) {
     struct stat src_stat, dst_stat;
-    return (stat(src, &src_stat) == 0) && 
-           (stat(dst, &dst_stat) != 0 || 
-            src_stat.st_mtime > dst_stat.st_mtime);
+    if (stat(src, &src_stat) != 0) return 0;
+    return (stat(dst, &dst_stat) != 0 || src_stat.st_mtime > dst_stat.st_mtime);
 }
-

@@ -1,39 +1,107 @@
 #include "utils/cache.h"
+#include "utils/path.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include <sys/stat.h>
+#include <unistd.h> // For access()
 
-// File format:
-// [Header]
-// 8 bytes: magic number 0xSS47CACE
-// 8 bytes: entry count
-// 
-// [Entries]
-// 8 bytes: path length
-// N bytes: path string
-// 8 bytes: output path length
-// N bytes: output path string
-// 8 bytes: last modified time
-// 8 bytes: content hash
-
+/* =============================================================================
+ *                      Binary Cache File Format
+ * =============================================================================
+ *
+ * This implementation uses a simple and robust binary format for speed and
+ * to avoid parsing complexities.
+ *
+ * [Header]
+ * 8 bytes: magic number 0x5353474341434543 ("SSGCACHE")
+ * 8 bytes: number of entries (uint64_t)
+ *
+ * [Entries] (repeated for each entry)
+ * 8 bytes: length of input_path string (including null terminator)
+ * N bytes: input_path string
+ * 8 bytes: length of output_path string (including null terminator)
+ * N bytes: output_path string
+ * 8 bytes: last_modified timestamp (time_t)
+ * 8 bytes: content_hash (uint64_t)
+ *
+ */
 static const uint64_t CACHE_MAGIC = 0x5353474341434543; // "SSGCACHE"
 
-void cache_init(BuildCache* cache, size_t initial_capacity) {
-    cache->entries = malloc(initial_capacity * sizeof(CacheEntry));
-    cache->count = 0;
-    cache->capacity = initial_capacity;
+
+/* =============================================================================
+ *              High-Performance Check & Management Functions
+ * =============================================================================
+ */
+
+/**
+ * @brief Checks if a file needs to be rebuilt using a hash table lookup.
+ * This is the core of the high-performance incremental build. It is O(1) on average.
+ */
+
+/**
+ * @brief Adds a new entry or updates an existing one in the cache hash table.
+ */
+void cache_update_entry(BuildCache* cache, const char* in_path,
+                       const char* out_path, time_t mtime, uint64_t hash) {
+    CacheEntry* entry = NULL;
+    HASH_FIND_STR(*cache, in_path, entry);
+
+    if (entry) {
+        // Entry already exists. Update its values in place.
+        free(entry->output_path); // Free the old output path string.
+        entry->output_path = strdup(out_path);
+        entry->last_modified = mtime;
+        entry->content_hash = hash;
+    } else {
+        // Entry does not exist. Allocate a new one and add it to the hash.
+        entry = malloc(sizeof(CacheEntry));
+        entry->input_path = strdup(in_path);
+        entry->output_path = strdup(out_path);
+        entry->last_modified = mtime;
+        entry->content_hash = hash;
+
+        // HASH_ADD_STR adds the new `entry` to the hash table `*cache`,
+        // using the `input_path` field as the key.
+        HASH_ADD_STR(*cache, input_path, entry);
+    }
 }
 
+/**
+ * @brief Frees all memory associated with the cache hash table.
+ */
 void cache_free(BuildCache* cache) {
-    for (size_t i = 0; i < cache->count; i++) {
-        free(cache->entries[i].input_path);
-        free(cache->entries[i].output_path);
+    CacheEntry *current_entry, *tmp;
+
+    // HASH_ITER is the safe iteration macro. It lets you delete while iterating.
+    HASH_ITER(hh, *cache, current_entry, tmp) {
+        HASH_DEL(*cache, current_entry); // Remove entry from the hash table.
+        free(current_entry->input_path);
+        free(current_entry->output_path);
+        free(current_entry); // Free the struct itself.
     }
-    free(cache->entries);
-    memset(cache, 0, sizeof(*cache));
 }
+
+/**
+ * @brief Removes entries from the cache if their source file no longer exists.
+ */
+void cache_purge_missing(BuildCache* cache) {
+    CacheEntry *current_entry, *tmp;
+    HASH_ITER(hh, *cache, current_entry, tmp) {
+        if (access(current_entry->input_path, F_OK) != 0) {
+            HASH_DEL(*cache, current_entry);
+            free(current_entry->input_path);
+            free(current_entry->output_path);
+            free(current_entry);
+        }
+    }
+}
+
+
+/* =============================================================================
+ *                      Cache Serialization (Load/Save)
+ * =============================================================================
+ */
 
 int cache_save(const BuildCache* cache, const char* path) {
     FILE* f = fopen(path, "wb");
@@ -41,23 +109,23 @@ int cache_save(const BuildCache* cache, const char* path) {
 
     // Write header
     fwrite(&CACHE_MAGIC, sizeof(CACHE_MAGIC), 1, f);
-    const uint64_t count = cache->count;
+    const uint64_t count = HASH_COUNT(*cache); // HASH_COUNT gets table size.
     fwrite(&count, sizeof(count), 1, f);
 
-    // Write entries
-    for (size_t i = 0; i < cache->count; i++) {
-        const CacheEntry* e = &cache->entries[i];
-        const uint64_t in_len = strlen(e->input_path) + 1;
-        const uint64_t out_len = strlen(e->output_path) + 1;
+    // Write entries by iterating through the hash table
+    CacheEntry *entry, *tmp;
+    HASH_ITER(hh, *cache, entry, tmp) {
+        const uint64_t in_len = strlen(entry->input_path) + 1;
+        const uint64_t out_len = strlen(entry->output_path) + 1;
 
         fwrite(&in_len, sizeof(in_len), 1, f);
-        fwrite(e->input_path, 1, in_len, f);
-        
+        fwrite(entry->input_path, 1, in_len, f);
+
         fwrite(&out_len, sizeof(out_len), 1, f);
-        fwrite(e->output_path, 1, out_len, f);
-        
-        fwrite(&e->last_modified, sizeof(e->last_modified), 1, f);
-        fwrite(&e->content_hash, sizeof(e->content_hash), 1, f);
+        fwrite(entry->output_path, 1, out_len, f);
+
+        fwrite(&entry->last_modified, sizeof(entry->last_modified), 1, f);
+        fwrite(&entry->content_hash, sizeof(entry->content_hash), 1, f);
     }
 
     fclose(f);
@@ -80,100 +148,35 @@ int cache_load(BuildCache* cache, const char* path) {
         return 0;
     }
 
-    cache->entries = realloc(cache->entries, count * sizeof(CacheEntry));
-    cache->capacity = count;
-    
     for (uint64_t i = 0; i < count; i++) {
-        CacheEntry* e = &cache->entries[i];
         uint64_t in_len, out_len;
+        char in_buf[PATH_MAX], out_buf[PATH_MAX];
+        time_t mtime;
+        uint64_t hash;
 
-        // Read input path
         if (fread(&in_len, sizeof(in_len), 1, f) != 1) goto error;
-        e->input_path = malloc(in_len);
-        if (fread(e->input_path, 1, in_len, f) != in_len) goto error;
-        
-        // Read output path
+        if (in_len > PATH_MAX || fread(in_buf, 1, in_len, f) != in_len) goto error;
+
         if (fread(&out_len, sizeof(out_len), 1, f) != 1) goto error;
-        e->output_path = malloc(out_len);
-        if (fread(e->output_path, 1, out_len, f) != out_len) goto error;
-        
-        // Read metadata
-        if (fread(&e->last_modified, sizeof(e->last_modified), 1, f) != 1) goto error;
-        if (fread(&e->content_hash, sizeof(e->content_hash), 1, f) != 1) goto error;
+        if (out_len > PATH_MAX || fread(out_buf, 1, out_len, f) != out_len) goto error;
+
+        if (fread(&mtime, sizeof(mtime), 1, f) != 1) goto error;
+        if (fread(&hash, sizeof(hash), 1, f) != 1) goto error;
+
+        // Use our standard update function to build the hash table.
+        cache_update_entry(cache, in_buf, out_buf, mtime, hash);
     }
 
-    cache->count = count;
     fclose(f);
     return 1;
 
 error:
-    cache_free(cache);
+    cache_free(cache); // Clean up partially built hash table on error.
     fclose(f);
     return 0;
 }
 
-void cache_add_entry(BuildCache* cache, const char* in_path, 
-                    const char* out_path, time_t mtime, uint64_t hash) {
-    if (cache->count >= cache->capacity) {
-        cache->capacity *= 2;
-        cache->entries = realloc(cache->entries, cache->capacity * sizeof(CacheEntry));
-    }
 
-    CacheEntry* e = &cache->entries[cache->count++];
-    e->input_path = strdup(in_path);
-    e->output_path = strdup(out_path);
-    e->last_modified = mtime;
-    e->content_hash = hash;
-}
-
-int cache_contains(const BuildCache* cache, const char* path) {
-    for (size_t i = 0; i < cache->count; i++) {
-        if (strcmp(cache->entries[i].input_path, path) == 0) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-
-// Add these functions after cache_load
-void cache_purge_missing(BuildCache* cache) {
-    size_t new_count = 0;
-    for (size_t i = 0; i < cache->count; i++) {
-        struct stat st;
-        if (stat(cache->entries[i].input_path, &st) == 0) {
-            cache->entries[new_count++] = cache->entries[i];
-        } else {
-            free(cache->entries[i].input_path);
-            free(cache->entries[i].output_path);
-        }
-    }
-    cache->count = new_count;
-}
-
-void cache_update_entry(BuildCache* cache, const char* in_path,
-                       const char* out_path, time_t mtime, uint64_t hash) {
-    for (size_t i = 0; i < cache->count; i++) {
-        if (strcmp(cache->entries[i].input_path, in_path) == 0) {
-            free(cache->entries[i].output_path);
-            cache->entries[i].output_path = strdup(out_path);
-            cache->entries[i].last_modified = mtime;
-            cache->entries[i].content_hash = hash;
-            return;
-        }
-    }
-    cache_add_entry(cache, in_path, out_path, mtime, hash);
-}
-
-
-CacheEntry* cache_get(BuildCache* cache, const char* input_path) {
-    for (size_t i = 0; i < cache->count; i++) {
-        if (strcmp(cache->entries[i].input_path, input_path) == 0) {
-            return &cache->entries[i];
-        }
-    }
-    return NULL;
-}
 
 uint64_t file_hash(const char* path) {
     FILE* f = fopen(path, "rb");
@@ -193,7 +196,6 @@ uint64_t file_hash(const char* path) {
     fclose(f);
     return hash;
 }
-
 
 uint64_t hash_from_memory(const char* data, size_t size) {
     uint64_t hash = 0xcbf29ce484222325; // FNV_offset_basis

@@ -76,12 +76,11 @@ int main(int argc, char** argv) {
     omp_set_num_threads(omp_get_max_threads());
 
     Arena arena;
-    BuildCache global_cache;
+    BuildCache global_cache = NULL;
     FileVector files;
     BuildMetrics metrics = {0};
 
     arena_init(&arena, 1024 * 1024);
-    cache_init(&global_cache, 128);
     vec_init(&files);
 
     cache_load(&global_cache, CACHE_FILE);
@@ -206,63 +205,65 @@ static void process_files_parallel(FileVector* files, const char* output_dir,
                                   const char* input_base) {
     #pragma omp parallel
     {
+        // Each thread gets its own independent resources
         WriteBatch local_batch = {0};
         Arena thread_arena;
-        Arena batch_arena;
-        BuildCache thread_cache; // For per-thread cache updates
-        arena_init(&thread_arena, 1024 * 1024);
-        arena_init(&batch_arena, 64 * 1024 * 1024);
-        cache_init(&thread_cache, 64);
+        BuildCache thread_cache = NULL; // A thread-local hash table, starts empty
         size_t local_built = 0;
+
+        arena_init(&thread_arena, 1024 * 1024);
 
         #pragma omp for schedule(dynamic)
         for (size_t i = 0; i < files->count; i++) {
             const char* input_path = files->items[i];
             
-            // This check is now much faster. It avoids expensive I/O.
             int should_rebuild = 0;
-            // The critical section is still needed for thread-safe cache reads
+            // The check must be in a critical section for thread-safe reads
+            // from the shared global_cache.
             #pragma omp critical(CacheCheck)
             {
-                // NOTE THE NEW SIGNATURE: only input_path and cache are needed now.
                 should_rebuild = needs_rebuild(input_path, global_cache);
             }
 
             if (should_rebuild) {
-                // Defer path generation and directory creation until we know we need it.
-                // This is a significant optimization.
                 char* output_path = generate_output_path(input_base, input_path, output_dir);
                 ensure_directory_exists(output_path);
 
                 process_file(&thread_arena, input_path, output_path, &thread_cache, &local_batch);
                 local_built++;
 
-                free(output_path); // Free the path when done
+                free(output_path);
             }
         }
         
+        // Flush any remaining files in this thread's batch.
         batch_flush(&local_batch);
 
         #pragma omp atomic
         metrics->built_files += local_built;
 
-        // Critical section for merging the thread-local caches into the global one.
+        // --- MERGE THE CACHES ---
+        // Each thread now merges its local `thread_cache` into the `global_cache`.
+        // This must be a critical section to prevent a race condition where multiple
+        // threads try to modify the global hash table at the same time.
         #pragma omp critical(CacheUpdate)
         {
-            for (size_t i = 0; i < thread_cache.count; i++) {
+            CacheEntry *entry, *tmp;
+            HASH_ITER(hh, thread_cache, entry, tmp) {
                 cache_update_entry(global_cache,
-                                 thread_cache.entries[i].input_path,
-                                 thread_cache.entries[i].output_path,
-                                 thread_cache.entries[i].last_modified,
-                                 thread_cache.entries[i].content_hash);
+                                 entry->input_path,
+                                 entry->output_path,
+                                 entry->last_modified,
+                                 entry->content_hash);
             }
         }
 
+        // Clean up thread-local resources
         arena_free(&thread_arena);
-        arena_free(&batch_arena);
         cache_free(&thread_cache);
     }
 }
+
 static char* generate_output_path(const char* base, const char* input, const char* output_dir) {
     const char* rel_path = input + strlen(base);
     if (*rel_path == '/') rel_path++;
@@ -291,50 +292,25 @@ static void ensure_directory_exists(const char* filepath) {
 }
 
 // In your main C file
-static void process_file(Arena* process_arena,
-                        const char* input_path, const char* output_path,
-                        BuildCache* cache, WriteBatch* batch) {
+static void process_file(Arena* process_arena, const char* input_path,
+                        const char* output_path, BuildCache* local_cache,
+                        WriteBatch* batch) {
     MappedFile input = mmap_file(input_path);
-    if (!input.data) {
-        fprintf(stderr, "Error mapping %s\n", input_path);
-        return;
-    }
+    if (!input.data) return;
 
-    // --- OPTIMIZATION 1: HASH FROM MEMORY ---
-    // Hash the file content that is already in memory. No second disk read.
     uint64_t content_hash = hash_from_memory(input.data, input.size);
-    // --- END OPTIMIZATION 1 ---
-
     MarkdownDoc doc = parse_markdown(process_arena, input.data, input.size);
-    munmap_file(input); // Unmap as soon as we're done with it.
-
-    if (!global_template.data) {
-        fprintf(stderr, "Template not loaded\n");
-        return;
-    }
+    munmap_file(input);
 
     char* html = render_template(process_arena, &doc.frontmatter, doc.html);
-
-    // --- OPTIMIZATION 2: AVOID MEMCPY ---
-    // The 'html' pointer is already allocated in an arena that will persist
-    // for the entire batch. We can add it directly to the batch.
-    // This requires that process_arena is NOT reset until after the batch is flushed.
-    // Given your loop structure, this is safe.
-    size_t html_len = strlen(html); // We still need the length for the batch.
-    batch_add(batch, output_path, html, html_len); // Add the original pointer, not a copy.
-    // --- END OPTIMIZATION 2 ---
+    size_t html_len = strlen(html);
+    batch_add(batch, output_path, html, html_len);
 
     struct stat st;
     if (stat(input_path, &st) == 0) {
-        // Use the hash we calculated earlier.
-        cache_add_entry(cache, input_path, output_path, st.st_mtime, content_hash);
+        // Add the build artifact to this thread's LOCAL cache.
+        cache_update_entry(local_cache, input_path, output_path, st.st_mtime, content_hash);
     }
-
-    // IMPORTANT: Do NOT reset the process_arena here.
-    // It holds the HTML content that the batch points to.
-    // Your current structure where the arena is freed at the end of the
-    // parallel block is correct for this optimization.
-    // arena_reset(process_arena); // <-- REMOVE THIS if it was inside the loop
 }
 
 void log_metrics(const BuildMetrics* metrics) {
