@@ -3,7 +3,9 @@
 
 #include <sys/stat.h>
 
+#ifndef PATH_MAX
 #define PATH_MAX 4096
+#endif
 
 char* strip_extension(const char* filename);
 const char* get_filename(const char* path);

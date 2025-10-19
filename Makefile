@@ -14,20 +14,20 @@ OBJECTS     := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SOURCES))
 CC          := gcc
 BASE_CFLAGS := -Wall -Wextra -Werror -pedantic -std=c11 -O3 -g -flto  \
                -Iinclude -DREPORT_INTERVAL=0.5 \
-               -I/opt/homebrew/Cellar/cmark/0.31.1/include/ \
+               -I/opt/homebrew/Cellar/cmark/0.31.1_1/include/ \
                -Xpreprocessor -fopenmp -Wno-pedantic \
-               -I/opt/homebrew/Cellar/libomp/19.1.7/include/
+               -I/opt/homebrew/opt/libomp/include/
 
 # Architecture-Specific Flags
 ifeq ($(UNAME_M),x86_64)
   SIMD_FLAGS := -mavx2 -mfma -march=native -DARCH_X86
 else ifeq ($(UNAME_M),arm64)
-  SIMD_FLAGS := -march=armv8-a+simd -DARCH_ARM -DNEON_ENABLED
+  SIMD_FLAGS := -march=armv8.5-a+simd+fp16+rcpc -DARCH_ARM -DNEON_ENABLED -mtune=native
 endif
 
 LDFLAGS     := -lm $(shell pkg-config --libs libcmark) -flto \
                -L/opt/homebrew/opt/libomp/lib -lomp \
-               -L/opt/homebrew/Cellar/cmark/0.31.1/lib
+               -L/opt/homebrew/Cellar/cmark/0.31.1_1/lib
 
 # Combine Flags
 CFLAGS := $(BASE_CFLAGS) $(SIMD_FLAGS)

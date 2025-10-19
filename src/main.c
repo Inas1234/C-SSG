@@ -73,14 +73,14 @@ int main(int argc, char** argv) {
     load_template();
     
 
-    omp_set_num_threads(omp_get_max_threads());
+    omp_set_num_threads(4); // Optimized for M1 Pro performance
 
     Arena arena;
     BuildCache global_cache = NULL;
     FileVector files;
     BuildMetrics metrics = {0};
 
-    arena_init(&arena, 1024 * 1024);
+    arena_init(&arena, 4 * 1024 * 1024); // 4MB arena
     vec_init(&files);
 
     cache_load(&global_cache, CACHE_FILE);
@@ -211,9 +211,9 @@ static void process_files_parallel(FileVector* files, const char* output_dir,
         BuildCache thread_cache = NULL; // A thread-local hash table, starts empty
         size_t local_built = 0;
 
-        arena_init(&thread_arena, 1024 * 1024);
+        arena_init(&thread_arena, 4 * 1024 * 1024); // 4MB per thread
 
-        #pragma omp for schedule(dynamic)
+        #pragma omp for schedule(static, 100)
         for (size_t i = 0; i < files->count; i++) {
             const char* input_path = files->items[i];
             

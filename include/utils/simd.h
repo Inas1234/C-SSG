@@ -2,6 +2,8 @@
 #ifndef SIMD_UTILS_H
 #define SIMD_UTILS_H
 
+#include <stddef.h>
+
 #ifdef __x86_64__
 #include <immintrin.h>
 #elif __aarch64__
@@ -17,5 +19,7 @@ typedef enum {
 
 SimdLevel detect_simd_support(void);
 char* simd_strstr(char* haystack, const char* needle);
+char* simd_strchr(const char* str, int c);
+char* simd_memchr(const char* str, int c, size_t len);
 
 #endif

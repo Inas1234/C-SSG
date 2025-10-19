@@ -25,7 +25,7 @@ static int parse_frontmatter(char* content, FrontMatter* fm, Arena* arena) {
     if (title_start) {
         title_start += 6;
         while (*title_start == ' ' || *title_start == '"') title_start++;
-        char* title_end = strchr(title_start, '\n');
+        char* title_end = simd_strchr(title_start, '\n');
         if (title_end) {
             while (title_end > title_start && 
                 (title_end[-1] == ' ' || title_end[-1] == '"')) {

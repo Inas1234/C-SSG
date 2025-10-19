@@ -2,6 +2,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "parser/mlindown_token.h"
+#include "utils/simd.h"
 
 static char *ltrim(char *s) {
     while (isspace((unsigned char)*s)) s++;
@@ -23,7 +24,7 @@ TokenList tokenize(const char *input) {
     TokenList tl = { .data = NULL, .count = 0 };
     const char *line_start = input;
     while (*line_start) {
-        const char *newline = strchr(line_start, '\n');
+        const char *newline = simd_strchr(line_start, '\n');
         size_t len = newline ? (size_t)(newline - line_start) : strlen(line_start);
 
         char *buf = malloc(len + 1);
