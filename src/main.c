@@ -193,33 +193,30 @@ char* render_template(Arena* arena, const FrontMatter* fm, const char* content) 
     }
     
     memcpy(ptr, template_parts.tail, template_parts.tail_len);
+    ptr += template_parts.tail_len;
     *ptr = '\0';
     
     return output;
 }
 
-// In your main C file
 
 static void process_files_parallel(FileVector* files, const char* output_dir,
                                   BuildCache* global_cache, BuildMetrics* metrics,
                                   const char* input_base) {
     #pragma omp parallel
     {
-        // Each thread gets its own independent resources
         WriteBatch local_batch = {0};
         Arena thread_arena;
-        BuildCache thread_cache = NULL; // A thread-local hash table, starts empty
+        BuildCache thread_cache = NULL; 
         size_t local_built = 0;
 
-        arena_init(&thread_arena, 4 * 1024 * 1024); // 4MB per thread
+        arena_init(&thread_arena, 4 * 1024 * 1024);
 
         #pragma omp for schedule(static, 100)
         for (size_t i = 0; i < files->count; i++) {
             const char* input_path = files->items[i];
             
             int should_rebuild = 0;
-            // The check must be in a critical section for thread-safe reads
-            // from the shared global_cache.
             #pragma omp critical(CacheCheck)
             {
                 should_rebuild = needs_rebuild(input_path, global_cache);
@@ -236,16 +233,11 @@ static void process_files_parallel(FileVector* files, const char* output_dir,
             }
         }
         
-        // Flush any remaining files in this thread's batch.
         batch_flush(&local_batch);
 
         #pragma omp atomic
         metrics->built_files += local_built;
 
-        // --- MERGE THE CACHES ---
-        // Each thread now merges its local `thread_cache` into the `global_cache`.
-        // This must be a critical section to prevent a race condition where multiple
-        // threads try to modify the global hash table at the same time.
         #pragma omp critical(CacheUpdate)
         {
             CacheEntry *entry, *tmp;
@@ -258,7 +250,6 @@ static void process_files_parallel(FileVector* files, const char* output_dir,
             }
         }
 
-        // Clean up thread-local resources
         arena_free(&thread_arena);
         cache_free(&thread_cache);
     }
@@ -291,7 +282,6 @@ static void ensure_directory_exists(const char* filepath) {
     free(dir);
 }
 
-// In your main C file
 static void process_file(Arena* process_arena, const char* input_path,
                         const char* output_path, BuildCache* local_cache,
                         WriteBatch* batch) {

@@ -29,62 +29,38 @@
 static const uint64_t CACHE_MAGIC = 0x5353474341434543; // "SSGCACHE"
 
 
-/* =============================================================================
- *              High-Performance Check & Management Functions
- * =============================================================================
- */
-
-/**
- * @brief Checks if a file needs to be rebuilt using a hash table lookup.
- * This is the core of the high-performance incremental build. It is O(1) on average.
- */
-
-/**
- * @brief Adds a new entry or updates an existing one in the cache hash table.
- */
 void cache_update_entry(BuildCache* cache, const char* in_path,
                        const char* out_path, time_t mtime, uint64_t hash) {
     CacheEntry* entry = NULL;
     HASH_FIND_STR(*cache, in_path, entry);
 
     if (entry) {
-        // Entry already exists. Update its values in place.
-        free(entry->output_path); // Free the old output path string.
+        free(entry->output_path);
         entry->output_path = strdup(out_path);
         entry->last_modified = mtime;
         entry->content_hash = hash;
     } else {
-        // Entry does not exist. Allocate a new one and add it to the hash.
         entry = malloc(sizeof(CacheEntry));
         entry->input_path = strdup(in_path);
         entry->output_path = strdup(out_path);
         entry->last_modified = mtime;
         entry->content_hash = hash;
 
-        // HASH_ADD_STR adds the new `entry` to the hash table `*cache`,
-        // using the `input_path` field as the key.
         HASH_ADD_STR(*cache, input_path, entry);
     }
 }
 
-/**
- * @brief Frees all memory associated with the cache hash table.
- */
 void cache_free(BuildCache* cache) {
     CacheEntry *current_entry, *tmp;
 
-    // HASH_ITER is the safe iteration macro. It lets you delete while iterating.
     HASH_ITER(hh, *cache, current_entry, tmp) {
-        HASH_DEL(*cache, current_entry); // Remove entry from the hash table.
+        HASH_DEL(*cache, current_entry); 
         free(current_entry->input_path);
         free(current_entry->output_path);
-        free(current_entry); // Free the struct itself.
+        free(current_entry);
     }
 }
 
-/**
- * @brief Removes entries from the cache if their source file no longer exists.
- */
 void cache_purge_missing(BuildCache* cache) {
     CacheEntry *current_entry, *tmp;
     HASH_ITER(hh, *cache, current_entry, tmp) {
@@ -97,22 +73,14 @@ void cache_purge_missing(BuildCache* cache) {
     }
 }
 
-
-/* =============================================================================
- *                      Cache Serialization (Load/Save)
- * =============================================================================
- */
-
 int cache_save(const BuildCache* cache, const char* path) {
     FILE* f = fopen(path, "wb");
     if (!f) return 0;
 
-    // Write header
     fwrite(&CACHE_MAGIC, sizeof(CACHE_MAGIC), 1, f);
-    const uint64_t count = HASH_COUNT(*cache); // HASH_COUNT gets table size.
+    const uint64_t count = HASH_COUNT(*cache); 
     fwrite(&count, sizeof(count), 1, f);
 
-    // Write entries by iterating through the hash table
     CacheEntry *entry, *tmp;
     HASH_ITER(hh, *cache, entry, tmp) {
         const uint64_t in_len = strlen(entry->input_path) + 1;
@@ -163,7 +131,6 @@ int cache_load(BuildCache* cache, const char* path) {
         if (fread(&mtime, sizeof(mtime), 1, f) != 1) goto error;
         if (fread(&hash, sizeof(hash), 1, f) != 1) goto error;
 
-        // Use our standard update function to build the hash table.
         cache_update_entry(cache, in_buf, out_buf, mtime, hash);
     }
 
@@ -171,7 +138,7 @@ int cache_load(BuildCache* cache, const char* path) {
     return 1;
 
 error:
-    cache_free(cache); // Clean up partially built hash table on error.
+    cache_free(cache);
     fclose(f);
     return 0;
 }
@@ -182,8 +149,8 @@ uint64_t file_hash(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) return 0;
 
-    uint64_t hash = 0xcbf29ce484222325; // FNV_offset_basis
-    const uint64_t prime = 0x100000001b3; // FNV_prime
+    uint64_t hash = 0xcbf29ce484222325; 
+    const uint64_t prime = 0x100000001b3; 
 
     unsigned char buf[4096];
     size_t bytes_read;
@@ -198,8 +165,8 @@ uint64_t file_hash(const char* path) {
 }
 
 uint64_t hash_from_memory(const char* data, size_t size) {
-    uint64_t hash = 0xcbf29ce484222325; // FNV_offset_basis
-    const uint64_t prime = 0x100000001b3; // FNV_prime
+    uint64_t hash = 0xcbf29ce484222325; 
+    const uint64_t prime = 0x100000001b3; 
 
     for (size_t i = 0; i < size; i++) {
         hash ^= data[i];
